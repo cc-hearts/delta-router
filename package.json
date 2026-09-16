@@ -1,0 +1,35 @@
+{
+  "name": "delta-router",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Route Delta's model traffic through any cc-switch provider — a scoped local MITM proxy (Anthropic Messages + OpenAI Responses) that only Delta uses.",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "bin": { "delta-router": "src/cli.js" },
+  "scripts": {
+    "start": "node src/tui.js",
+    "tui": "node src/tui.js",
+    "serve": "node src/server.js",
+    "doctor": "node src/cli.js doctor",
+    "test-delta": "node src/cli.js test-delta",
+    "status": "node src/cli.js status",
+    "setup-ca": "bash scripts/setup-ca.sh"
+  },
+  "keywords": [
+    "delta",
+    "zed",
+    "cc-switch",
+    "llm-router",
+    "mitm",
+    "anthropic",
+    "openai",
+    "claude-code",
+    "codex",
+    "macos",
+    "tui"
+  ],
+  "repository": { "type": "git", "url": "git+https://github.com/cc-hearts/delta-router.git" },
+  "homepage": "https://github.com/cc-hearts/delta-router#readme",
+  "bugs": { "url": "https://github.com/cc-hearts/delta-router/issues" }
+}

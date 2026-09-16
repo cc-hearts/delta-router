@@ -1,0 +1,31 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 8788 },
+  "tls": { "ca": "certs/ca.pem", "cert": "certs/server.crt", "key": "certs/server.key" },
+  "intercept": ["api.anthropic.com", "api.openai.com"],
+  "routes": {
+    "api.anthropic.com": {
+      "protocol": "anthropic",
+      "ccswitchAppType": "claude",
+      "staticFirst": false,
+      "static": [],
+      "modelMap": {},
+      "stripFields": [],
+      "authStyle": "both",
+      "retryStatuses": [401, 402, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 529]
+    },
+    "api.openai.com": {
+      "protocol": "openai",
+      "ccswitchAppType": "codex",
+      "staticFirst": false,
+      "static": [],
+      "modelMap": {},
+      "stripFields": [],
+      "authStyle": "bearer",
+      "modelFallback": ["gpt-5.6-sol"],
+      "retryStatuses": [401, 402, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 529]
+    }
+  },
+  "ccswitch": { "db": "~/.cc-switch/cc-switch.db", "cacheMs": 15000 },
+  "upstreamTimeoutMs": 600000,
+  "logFile": "logs/router.log"
+}
