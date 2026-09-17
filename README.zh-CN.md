@@ -28,20 +28,21 @@ Delta ──┐  native.proxy = http://127.0.0.1:8788   （写在 Delta 自己�
                                   │
                                   ▼
                     ~/.cc-switch/cc-switch.db
-                    providers 表 app_type = claude  （Anthropic Messages 协议）
-                                     或 codex     （OpenAI Responses 协议）
+                    providers 表 app_type = claude    （Anthropic Messages）
+                                     或 codex     （OpenAI Responses）
+                                     或 opencode  （OpenAI Chat Completions）
                                   │
                                   ▼
                     https://your-relay.example/v1/messages
 ```
 
-上游顺序完全镜像 cc-switch：**current 排第一**，其余留作 failover；遇到可重试的响应（`401/402/403/404/429/5xx`）自动切下一条。每个请求一行日志。
+每条通道只打**一条**上游：cc-switch 里那个 app（claude / codex / opencode）**当前选中的 provider**。换 provider 就是在 cc-switch 里点一下，路由器下一个请求就跟着换。没有 failover。每个请求一行日志。
 
 ## 作用域与安全
 
 - **只影响 Delta**：不改 `/etc/hosts`、不改系统代理、不需要 `sudo`。
 - 本地 CA **只装在本用户的登录钥匙串里，并且信任策略限定为 SSL**（`security add-trusted-cert -r trustRoot -p ssl -k ~/Library/Keychains/login.keychain-db`），一条命令就能卸掉。
-- 你的真实 key 永远不进 Delta：Delta 存的是占位符（`ANTHROPIC_API_KEY=delta-router`、`OPENAI_API_KEY=delta-router`），真实凭据由路由器在服务端替换。
+- 你的真实 key 永远不进 Delta：`write-keys` 会写四个占位符（`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`OPENCODE_API_KEY`、`OPENCODE_GO_API_KEY`），真实凭据由路由器在服务端替换。Delta 是「有凭据才启用该 provider」，所以占位符就是它列出模型的前提 —— 值本身无意义，也从不会被上游看到。
 - 只有 `config.json:intercept` 里列出的域名会被解密，其余流量原样隧道透传。
 - `certs/`（CA 与叶子私钥）和 `logs/` 已在 `.gitignore` 中。
 
@@ -81,16 +82,16 @@ npm start
   router   running pid 1234   127.0.0.1:8788
   delta    proxy ok   key ok   ca ok
 ────────────────────────────────────────────────────────────
- ROUTES （跟随 cc-switch 的 current provider）
-  api.anthropic.com → <你的 provider>  https://your-relay.example  47/9 259ms
-                       ↳ <failover 1>  https://relay-2.example
-  api.openai.com → <你的 provider>  https://your-relay.example  14 1193ms
+ ROUTES （= cc-switch 里各 app 当前选中的 provider）
+  api.anthropic.com → <选中的 claude>  https://your-relay.example  47/9 259ms
+  api.openai.com → <选中的 codex>  https://relay-2.example  14 1193ms
+  opencode.ai → <选中的 opencode>  https://api.moonshot.cn/v1  8 640ms
 ACTIVITY
 ────────────────────────────────────────────────────────────
 s 启动/暂停   d doctor   c 卸载证书   q 退出
 ```
 
-只有四个键：
+只有四个键（`q` 和 `Ctrl-C` 等价）：
 
 | 键 | 作用 |
 | --- | --- |
@@ -98,6 +99,8 @@ s 启动/暂停   d doctor   c 卸载证书   q 退出
 | `d` | 跑 `doctor`，输出直接打进面板 |
 | `c` | 安装 / 卸载本地证书 |
 | `q` | 退出 |
+
+退出是立即的、不做任何清理：不碰证书，也不会等正在跑的命令 —— 按 `q` / `Ctrl-C` 会杀掉面板起的子进程直接走。证书操作要等 macOS 授权弹窗，等待期间面板照常响应（提示会显示"等待系统授权 …"），`q` 会取消它并退出。`Ctrl-C` 只退出，不会误触 `c` 的证书开关。
 
 `ACTIVITY` 只显示**本次启动之后**的日志（外加 `doctor` 输出），一个请求一行，没有 TLS / 隧道的噪音。每条路由右侧的成功/失败计数来自历史流量，用来看哪条中转不稳。
 
@@ -122,13 +125,11 @@ s 启动/暂停   d doctor   c 卸载证书   q 退出
 | `listen` | 代理监听地址（默认 `127.0.0.1:8788`） |
 | `tls` | `certs/` 下的本地 CA 与叶子证书 |
 | `intercept` | 需要解密并改道的域名 |
-| `routes.<host>.protocol` | 上游协议：`anthropic` 或 `openai` |
-| `routes.<host>.ccswitchAppType` | 读 cc-switch 哪张表：`claude` 或 `codex` |
+| `routes.<host>.ccswitchAppType` | 这条通道接到 cc-switch 的哪个 app：`claude` / `codex` / `opencode`。上游就是该 app 当前选中的那条 provider |
 | `routes.<host>.authStyle` | 凭据的发送方式：`both` / `x-api-key` / `bearer` |
-| `routes.<host>.modelMap` | 转发前改写模型 id |
+| `routes.<host>.modelMap` | 转发前改写模型 id（默认不写，模型 id 原样透传） |
 | `routes.<host>.stripFields` | 丢掉上游不认的请求字段 |
-| `routes.<host>.static` / `staticFirst` | 手写上游，优先级更高 |
-| `routes.<host>.retryStatuses` | 触发 failover 的状态码 |
+| `routes.<host>.stripPrefix` | 转发前剥掉拦截域名自己的路径前缀（`opencode.ai/zen/go` → 上游 `/v1/...`） |
 | `routes.<host>.modelFallback` | 上游没有 `GET /v1/models` 时返回的模型列表 |
 | `ccswitch.cacheMs` | provider 列表缓存时长（默认 15 秒） |
 
@@ -137,10 +138,23 @@ s 启动/暂停   d doctor   c 卸载证书   q 退出
 ## 再加一家 / 再支持一种协议
 
 1. 把域名加进 `intercept`；
-2. 加一条路由，填对 `protocol` 与 `ccswitchAppType`；
-3. 重跑 `npm run setup-ca`（复用现有 CA，只重签叶子证书覆盖新 SAN），**不需要**重新 `trust-ca`。
+2. 加一条路由，填 `ccswitchAppType`（`claude` / `codex` / `opencode`）；
+3. 重跑 `npm run setup-ca`（复用现有 CA，只重签叶子证书覆盖新 SAN），**不需要**重新 `trust-ca`；
+4. 如果拦截域名把流量放在自己的路径前缀下（`opencode.ai/zen/v1/chat/completions`），加 `stripPrefix` 把它剥掉 —— 除此之外没有别的开关，`doctor` 的探针形状也是按 `ccswitchAppType` 推出来的。
 
-目前支持 Anthropic Messages（`/v1/messages`，SSE 流式）与 OpenAI Responses（`/v1/responses`），含 WebSocket 升级；另有两个兜底：上游不实现 `count_tokens` 时本地估算，`GET /v1/models` 可回落到配置的列表。
+三种形状：Anthropic Messages（`/v1/messages`）、OpenAI Responses（`/v1/responses`）、OpenAI Chat Completions（`/v1/chat/completions`），各自对应 `claude` / `codex` / `opencode`。改道器不做协议转换 —— cc-switch 里选中的那条上游必须说同一种形状。WebSocket 升级原样转发。
+
+已接的路由：
+
+| 拦截域名 | 形状 | 上游来自 |
+| --- | --- | --- |
+| `api.anthropic.com` | Anthropic Messages | cc-switch `claude` 当前选中 |
+| `api.openai.com` | Responses（含 wss） | cc-switch `codex` 当前选中 |
+| `opencode.ai` | Chat Completions（Zen `/zen/v1`、Go `/zen/go/v1`） | cc-switch `opencode` 当前选中 |
+
+`opencode.ai` 的目录来自 `models.opencode.ai`（**不**拦截），Delta 的 OpenCode 目录里是裸 id（`kimi-k3`、`glm-5.3`…），和 cc-switch `opencode` provider 的 `models` 键名一致 → 不需要 `modelMap`。非推理路径（`/zen/go/v1/usage`、登录）不在拦截之列 —— 它们也会被改道到 cc-switch 那条上游，用量显示因此不可用（仅影响显示）。
+
+模型 id 一律原样转给上游；只有你显式写了 `modelMap` 才会改写。
 
 ## 排错
 
@@ -148,8 +162,9 @@ s 启动/暂停   d doctor   c 卸载证书   q 退出
 | --- | --- |
 | 顶部显示 `proxy 未接入` | `node src/cli.js install-delta`，然后重启 Delta |
 | 顶部显示 `ca 未信任` | TUI 里按 `c`（或 `node src/cli.js trust-ca`） |
-| 顶部显示 `key 缺失` | `node src/cli.js write-keys`，然后重启 Delta |
-| 日志里出现 `RETRY … 401` | 那条中转的 token 失效了 —— 去 cc-switch 换 provider |
+| 顶部显示 `key 缺失`，或 Delta 里某个 provider 没有模型 | `node src/cli.js write-keys`，然后重启 Delta —— Delta 是「有凭据才列出模型」，占位符就够 |
+| 某条通道报 401/403/5xx | 那是 cc-switch 里该 app **当前选中**那条上游的声音 —— 去 cc-switch 换一条，或修它的 token |
+| `doctor` 有 FAIL | 逐条就是「cc-switch 当前选的那条 provider 不通」；`cc-switch providers for <host>` 一行会告诉你是哪条 |
 | Delta 完全没网 | 路由器挂了：TUI 里按 `s`；逃生出口是 `node src/cli.js uninstall-delta` |
 | 日志出现 `count_tokens estimated` | 正常：上游没有 `count_tokens`，由本机估算 |
 | Delta 自己改回设置 | Delta 保存设置时会重写 `settings.json`；若 `native.proxy` 消失，顶部会提示 |

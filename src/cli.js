@@ -23,7 +23,7 @@ function throughProxy(host, route, pathname, body, method = 'POST') {
     '-sS', '--noproxy', '', '-x', delta.proxyUrl(cfg), '--cacert', cfg.tls.ca,
     '-w', '\n%{http_code}', '--max-time', '180', '-X', method,
   ];
-  if (route.protocol === 'anthropic') {
+  if (route.ccswitchAppType === 'claude') {
     args.push('-H', 'anthropic-version: 2023-06-01', '-H', 'x-api-key: doctor-placeholder');
   } else {
     args.push('-H', 'authorization: Bearer doctor-placeholder');
@@ -35,12 +35,45 @@ function throughProxy(host, route, pathname, body, method = 'POST') {
   return { status: Number(out.slice(nl + 1).trim()), body: out.slice(0, nl) };
 }
 
-function openAiProbe(c) {
-  const active = resolveUpstreams(c, c.routes['api.openai.com'])[0];
+/**
+ * How `doctor` proves each route end to end. The shape follows the cc-switch app the route maps
+ * to, and the path Delta itself uses is the route's `stripPrefix` plus that shape's path.
+ */
+const PROBE_SHAPES = {
+  claude: {
+    path: '/v1/messages',
+    body: (model) => ({
+      model,
+      max_tokens: 32,
+      stream: true,
+      messages: [{ role: 'user', content: 'Reply with the single word: pong' }],
+    }),
+    sse: /event: message_start/,
+  },
+  codex: {
+    path: '/v1/responses',
+    body: (model) => ({ model, input: [{ role: 'user', content: 'say pong' }], stream: true }),
+    sse: /^event: /m,
+  },
+  opencode: {
+    path: '/v1/chat/completions',
+    body: (model) => ({
+      model,
+      messages: [{ role: 'user', content: 'Reply with the single word: pong' }],
+      max_tokens: 16,
+      stream: true,
+    }),
+    sse: /^data: /m,
+  },
+};
+
+function routeProbe(c, route) {
+  const shape = PROBE_SHAPES[route.ccswitchAppType];
+  const model = resolveUpstreams(c, route)[0]?.hint || 'gpt-5.6-sol';
   return {
-    model: active?.hint || 'gpt-5.6-sol',
-    input: [{ role: 'user', content: 'say pong' }],
-    stream: true,
+    ...shape,
+    body: shape.body(model),
+    path: (route.stripPrefix?.[0] ?? '') + shape.path,
   };
 }
 
@@ -66,57 +99,20 @@ const commands = {
       check(
         `cc-switch providers for ${host}`,
         upstreams.length > 0,
-        upstreams.map((u) => u.name).join(' -> ') || `no ${route.protocol} provider in cc-switch`,
+        upstreams.map((u) => u.name).join(' -> ') || `cc-switch has no ${route.ccswitchAppType} provider`,
       );
     }
 
     const before = logLines().length;
-    const anthropic = [
-      ['GET /v1/models through router', () => throughProxy('api.anthropic.com', cfg.routes['api.anthropic.com'], '/v1/models', null, 'GET')],
-      [
-        'POST /v1/messages/count_tokens',
-        () =>
-          throughProxy('api.anthropic.com', cfg.routes['api.anthropic.com'], '/v1/messages/count_tokens', {
-            model: 'claude-opus-5',
-            messages: [{ role: 'user', content: 'hello' }],
-          }),
-      ],
-      [
-        'POST /v1/messages (streaming)',
-        () =>
-          throughProxy('api.anthropic.com', cfg.routes['api.anthropic.com'], '/v1/messages', {
-            model: 'claude-opus-5',
-            max_tokens: 32,
-            stream: true,
-            messages: [{ role: 'user', content: 'Reply with the single word: pong' }],
-          }),
-      ],
-    ];
-    for (const [name, run] of anthropic) {
+    for (const { host, route } of routesOf(cfg)) {
+      const { path, body, sse } = routeProbe(cfg, route);
+      const name = `${host} POST ${path} (streaming)`;
       try {
-        const res = run();
-        const sse = res.body.includes('event: message_start');
-        check(name, res.status === 200, `HTTP ${res.status}${name.includes('streaming') ? (sse ? ', SSE ok' : ', no SSE') : ''}`);
+        const res = throughProxy(host, route, path, body);
+        const ok = res.status === 200 && sse.test(res.body);
+        check(name, ok, `HTTP ${res.status}${ok ? ', SSE ok' : ''}`);
       } catch (err) {
         check(name, false, err.message);
-      }
-    }
-
-    if (cfg.routes['api.openai.com']) {
-      try {
-        const res = throughProxy(
-          'api.openai.com',
-          cfg.routes['api.openai.com'],
-          '/v1/responses',
-          openAiProbe(cfg),
-        );
-        check(
-          'POST /v1/responses (streaming, Codex route)',
-          res.status === 200 && /^event: /m.test(res.body),
-          `HTTP ${res.status}${/^event: /m.test(res.body) ? ', SSE ok' : ''}`,
-        );
-      } catch (err) {
-        check('POST /v1/responses (streaming, Codex route)', false, err.message);
       }
     }
 
@@ -165,7 +161,7 @@ const commands = {
     console.log('routes (mirror of cc-switch):');
     for (const { host, route } of routesOf(cfg)) {
       const list = resolveUpstreams(cfg, route);
-      if (!list.length) console.log(`  ${host}: no ${route.protocol} provider in cc-switch`);
+      if (!list.length) console.log(`  ${host}: cc-switch has no ${route.ccswitchAppType} provider`);
       list.forEach((u, i) => {
         console.log(
           `  ${i === 0 ? '*' : ' '} ${host.padEnd(20)} ${u.name.padEnd(24)} ${u.base.padEnd(34)}` +
@@ -210,14 +206,14 @@ const commands = {
     console.log(`removed ${agent.LABEL}`);
   },
 
-  'trust-ca'() {
-    console.log(delta.trustCa());
+  async 'trust-ca'() {
+    console.log(await delta.trustCa());
     const bad = !delta.caTrusted();
     if (bad) process.exit(1);
   },
 
-  'untrust-ca'() {
-    console.log(delta.untrustCa());
+  async 'untrust-ca'() {
+    console.log(await delta.untrustCa());
   },
 };
 
@@ -238,4 +234,10 @@ if (!commands[cmd]) {
   console.error(USAGE);
   process.exit(cmd === 'help' ? 0 : 2);
 }
-commands[cmd]();
+const pending = commands[cmd]();
+if (pending instanceof Promise) {
+  pending.catch((err) => {
+    console.error(err?.stack ?? err);
+    process.exit(1);
+  });
+}

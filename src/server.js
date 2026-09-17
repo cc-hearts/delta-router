@@ -113,10 +113,20 @@ function blindTunnel(clientSocket, head, host, port) {
 
 // ------------------------------------------------------------------- routing
 
-/** Joins an upstream base with the incoming path, without duplicating /v1. */
-function joinUrl(base, reqPath) {
+/**
+ * Joins an upstream base with the incoming path, without duplicating /v1.
+ * `stripPrefixes` drops the intercepted host's own routing prefix, longest first
+ * (eg. opencode.ai/zen/go + /v1/... -> upstream /v1/...).
+ */
+function joinUrl(base, reqPath, stripPrefixes = []) {
+  let p = reqPath.startsWith('/') ? reqPath : `/${reqPath}`;
+  for (const prefix of [...stripPrefixes].sort((a, b) => b.length - a.length)) {
+    if (p === prefix || p.startsWith(`${prefix}/`)) {
+      p = p.slice(prefix.length) || '/';
+      break;
+    }
+  }
   const b = base.replace(/\/+$/, '');
-  const p = reqPath.startsWith('/') ? reqPath : `/${reqPath}`;
   if (b.endsWith('/v1') && p.startsWith('/v1/')) return b + p.slice(3);
   return b + p;
 }
@@ -149,7 +159,7 @@ mitmServer.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
-  const target = new URL(joinUrl(upstream.base, req.url));
+  const target = new URL(joinUrl(upstream.base, req.url, route.stripPrefix));
   const headers = upstreamHeaders(req, upstream, route);
   headers.host = target.host;
 
@@ -206,68 +216,60 @@ async function handleRouted(req, res, host) {
 
   const raw = await readBody(req);
   const { body, model } = prepareBody(route, req, raw);
-  const upstreams = resolveUpstreams(cfg, route);
+  const [upstream] = resolveUpstreams(cfg, route);
 
-  if (upstreams.length === 0) {
-    log(`ROUTE ${host}${req.url}: no upstream configured`);
+  if (!upstream) {
+    log(`ROUTE ${host}${req.url}: no ${route.ccswitchAppType} provider selected in cc-switch`);
     res.writeHead(502, { 'content-type': 'application/json' });
     return res.end(
       JSON.stringify({
         type: 'error',
-        error: { type: 'api_error', message: 'delta-router: no upstream provider configured' },
+        error: {
+          type: 'api_error',
+          message: `delta-router: cc-switch has no ${route.ccswitchAppType} provider selected`,
+        },
       }),
     );
   }
 
-  const retryStatuses = new Set(route.retryStatuses ?? []);
-  let lastFailure = 'no attempt made';
-
-  for (let i = 0; i < upstreams.length; i++) {
-    const upstream = upstreams[i];
-    const last = i === upstreams.length - 1;
-    let target;
-    try {
-      target = new URL(joinUrl(upstream.base, req.url));
-    } catch (err) {
-      lastFailure = `${upstream.name}: bad base url ${upstream.base}`;
-      continue;
-    }
-
-    const headers = upstreamHeaders(req, upstream, route);
-    if (body.length) headers['content-length'] = String(body.length);
-    const started = Date.now();
-
-    try {
-      const outcome = await attempt({ req, res, target, upstream, headers, body, retryStatuses, last, route, started });
-      if (outcome === 'retry') {
-        lastFailure = `${upstream.name}: retryable response`;
-        invalidateUpstreamCache();
-        continue;
-      }
-      log(
-        `ROUTE ${req.method} ${host}${req.url} model=${model ?? '-'} -> ${upstream.name} ` +
-          `${outcome.status} ${Date.now() - started}ms${outcome.note ? ` (${outcome.note})` : ''}`,
-      );
-      return;
-    } catch (err) {
-      lastFailure = `${upstream.name}: ${err.message}`;
-      log(`FAIL ${host}${req.url} -> ${upstream.name}: ${err.message}`);
-      invalidateUpstreamCache();
-    }
-  }
-
-  if (!res.headersSent) {
+  let target;
+  try {
+    target = new URL(joinUrl(upstream.base, req.url, route.stripPrefix));
+  } catch (err) {
     res.writeHead(502, { 'content-type': 'application/json' });
-    res.end(
+    return res.end(
       JSON.stringify({
         type: 'error',
-        error: { type: 'api_error', message: `delta-router: all upstreams failed (${lastFailure})` },
+        error: { type: 'api_error', message: `delta-router: bad base url ${upstream.base}` },
       }),
     );
+  }
+
+  const headers = upstreamHeaders(req, upstream, route);
+  if (body.length) headers['content-length'] = String(body.length);
+  const started = Date.now();
+
+  try {
+    const outcome = await attempt({ req, res, target, upstream, headers, body, route, started });
+    log(
+      `ROUTE ${req.method} ${host}${req.url} model=${model ?? '-'} -> ${upstream.name} ` +
+        `${outcome.status} ${Date.now() - started}ms${outcome.note ? ` (${outcome.note})` : ''}`,
+    );
+  } catch (err) {
+    log(`FAIL ${host}${req.url} -> ${upstream.name}: ${err.message}`);
+    if (!res.headersSent) {
+      res.writeHead(502, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          type: 'error',
+          error: { type: 'api_error', message: `delta-router: ${upstream.name} failed (${err.message})` },
+        }),
+      );
+    }
   }
 }
 
-function attempt({ req, res, target, upstream, headers, body, retryStatuses, last, route, started }) {
+function attempt({ req, res, target, upstream, headers, body, route, started }) {
   return new Promise((resolve, reject) => {
     const upReq = https.request(
       {
@@ -283,14 +285,8 @@ function attempt({ req, res, target, upstream, headers, body, retryStatuses, las
       (upRes) => {
         const status = upRes.statusCode ?? 502;
 
-        if (retryStatuses.has(status) && !last) {
-          log(`RETRY ${target.hostname}${target.pathname} -> ${upstream.name} ${status} (next upstream)`);
-          upRes.resume();
-          return resolve('retry');
-        }
-
         // Some relays do not implement count_tokens; Delta uses it for the context meter.
-        if (route.protocol === 'anthropic' && req.url.endsWith('/count_tokens') && status >= 400) {
+        if (route.ccswitchAppType === 'claude' && req.url.endsWith('/count_tokens') && status >= 400) {
           upRes.resume();
           const estimate = Math.ceil(body.length / 4);
           res.writeHead(200, { 'content-type': 'application/json' });

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { loadConfig } from './config.js';
 
 export const DELTA_SETTINGS = path.join(
@@ -42,25 +42,41 @@ export function uninstallProxy() {
 export const DELTA_ENV = path.join(os.homedir(), '.config/delta/.env');
 
 const PLACEHOLDER = 'delta-router';
+/**
+ * One placeholder per provider Delta needs a credential for — the router swaps in the real token
+ * on the way out, so Delta never holds one. Delta only surfaces a provider's models once it has
+ * some credential, which is why these have to exist even though the value is meaningless.
+ */
+const PLACEHOLDER_VARS = [
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENCODE_API_KEY',
+  'OPENCODE_GO_API_KEY',
+];
 
 export function placeholderKeysPresent() {
   if (!fs.existsSync(DELTA_ENV)) return false;
   const text = fs.readFileSync(DELTA_ENV, 'utf8');
-  return (
-    new RegExp(`^\\s*ANTHROPIC_API_KEY\\s*=\\s*\\S+`, 'm').test(text) &&
-    new RegExp(`^\\s*OPENAI_API_KEY\\s*=\\s*\\S+`, 'm').test(text)
-  );
+  return PLACEHOLDER_VARS.every((name) => new RegExp(`^\\s*${name}\\s*=\\s*\\S+`, 'm').test(text));
 }
 
 export function writePlaceholderKeys() {
   fs.mkdirSync(path.dirname(DELTA_ENV), { recursive: true });
+  // Keys the router does not own (a real OPENROUTER_API_KEY lives here) survive a rewrite.
+  const existing = fs.existsSync(DELTA_ENV) ? fs.readFileSync(DELTA_ENV, 'utf8').split('\n') : [];
+  const foreign = existing.filter(
+    (line) =>
+      /^\s*[A-Za-z_][A-Za-z0-9_]*\s*=/.test(line) &&
+      !PLACEHOLDER_VARS.some((name) => new RegExp(`^\\s*${name}\\s*=`).test(line)),
+  );
   fs.writeFileSync(
     DELTA_ENV,
     [
-      '# 占位符：真实 token 由 delta-router 注入，不会写进 Delta。',
+      '# 占位符：Delta 里一个真 key 都不需要，推理时由 delta-router 换成 cc-switch 的凭据。',
+      '# Delta 是「有凭据才启用该 provider」，所以这些占位符就是它出现模型的前提。',
       '# 改完需要重启 Delta（凭据在启动时读取）。',
-      `ANTHROPIC_API_KEY=${PLACEHOLDER}`,
-      `OPENAI_API_KEY=${PLACEHOLDER}`,
+      ...PLACEHOLDER_VARS.map((name) => `${name}=${PLACEHOLDER}`),
+      ...foreign,
       '',
     ].join('\n'),
   );
@@ -69,32 +85,56 @@ export function writePlaceholderKeys() {
 
 // ------------------------------------------------------------------ certificate
 
+/** macOS can hold `security` on an authorization prompt; never let that block a caller. */
+const SECURITY_TIMEOUT_MS = 3000;
+
 export function caTrusted() {
   const cfg = loadConfig();
   if (!fs.existsSync(cfg.tls.cert)) return false;
-  return (
-    spawnSync('security', ['verify-cert', '-p', 'ssl', '-c', cfg.tls.cert], { stdio: 'ignore' })
-      .status === 0
-  );
+  const res = spawnSync('security', ['verify-cert', '-p', 'ssl', '-c', cfg.tls.cert], {
+    stdio: 'ignore',
+    timeout: SECURITY_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+  });
+  return res.status === 0;
 }
 
-export function trustCa() {
+/**
+ * Async so a password prompt cannot freeze the caller's event loop; `signal` aborts (and kills)
+ * a prompt the user no longer wants — eg. when the TUI quits.
+ */
+function securityRun(args, { signal } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn('security', args, { signal });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (chunk) => (out += chunk));
+    child.stderr.on('data', (chunk) => (err += chunk));
+    child.on('error', (e) =>
+      resolve({ ok: false, detail: e.name === 'AbortError' ? '已取消' : e.message }),
+    );
+    child.on('close', (status) =>
+      resolve({ ok: status === 0, detail: (err || out).trim() }),
+    );
+  });
+}
+
+export async function trustCa({ signal } = {}) {
   const cfg = loadConfig();
   const keychain = path.join(os.homedir(), 'Library/Keychains/login.keychain-db');
-  const res = spawnSync(
-    'security',
+  const res = await securityRun(
     ['add-trusted-cert', '-r', 'trustRoot', '-p', 'ssl', '-k', keychain, cfg.tls.ca],
-    { encoding: 'utf8' },
+    { signal },
   );
-  return res.status === 0
+  return res.ok
     ? `已安装证书（${path.basename(cfg.tls.ca)} 信任范围：SSL，仅本用户）`
-    : `安装失败: ${(res.stderr || res.stdout).trim()}`;
+    : `安装失败: ${res.detail}`;
 }
 
-export function untrustCa() {
+export async function untrustCa({ signal } = {}) {
   const cfg = loadConfig();
   const der = execFileSync('openssl', ['x509', '-outform', 'der'], { input: fs.readFileSync(cfg.tls.ca, 'utf8') });
   const sha = execFileSync('openssl', ['sha1', '-r'], { input: der }).toString().split(' ')[0].toUpperCase();
-  const res = spawnSync('security', ['delete-certificate', '-Z', sha], { encoding: 'utf8' });
-  return res.status === 0 ? `已卸载证书（${sha.slice(0, 12)}…）` : `卸载失败: ${(res.stderr || res.stdout).trim()}`;
+  const res = await securityRun(['delete-certificate', '-Z', sha], { signal });
+  return res.ok ? `已卸载证书（${sha.slice(0, 12)}…）` : `卸载失败: ${res.detail}`;
 }

@@ -30,18 +30,19 @@ Delta ──┐  native.proxy = http://127.0.0.1:8788   (in Delta's own settings
                     ~/.cc-switch/cc-switch.db
                     providers where app_type = claude  (Anthropic Messages wire)
                                         or codex       (OpenAI Responses wire)
+                                        or opencode    (OpenAI Chat Completions wire)
                                   │
                                   ▼
                     https://your-relay.example/v1/messages
 ```
 
-Upstream order mirrors cc-switch exactly: its **current** provider first, the remaining ones kept as failover. Retryable upstream answers (`401/402/403/404/429/5xx`) fall through to the next provider automatically, and every request is logged in one line.
+Each route talks to exactly **one** upstream: the provider cc-switch currently has selected for that app (claude / codex / opencode). Switch provider in cc-switch and the next request follows. No failover, one log line per request.
 
 ## Scope and safety
 
 - **Delta only.** No `/etc/hosts` edit, no system-wide proxy, no `sudo`.
 - The local CA is trusted **at user level and restricted to the SSL policy** (`security add-trusted-cert -r trustRoot -p ssl -k ~/Library/Keychains/login.keychain-db`), and is one command to remove.
-- Your real API keys never enter Delta. Delta stores a placeholder (`ANTHROPIC_API_KEY=delta-router`, `OPENAI_API_KEY=delta-router`); the router swaps in the credential from cc-switch server-side.
+- Your real API keys never enter Delta. `write-keys` writes four placeholders (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENCODE_API_KEY`, `OPENCODE_GO_API_KEY`) and the router swaps in the credential from cc-switch server-side. Delta only surfaces a provider (and its models) once that provider has *some* credential, so the placeholders are what make the models appear — their value is never seen upstream.
 - Only hosts listed in `config.json:intercept` are decrypted. Everything else is a plain TCP tunnel.
 - `certs/` (CA + leaf private keys) and `logs/` are gitignored.
 
@@ -81,16 +82,16 @@ npm start
   router   running pid 1234   127.0.0.1:8788
   delta    proxy ok   key ok   ca ok
 ────────────────────────────────────────────────────────────
- ROUTES （跟随 cc-switch 的 current provider）
-  api.anthropic.com → <your provider>  https://your-relay.example  47/9 259ms
-                       ↳ <failover 1>  https://relay-2.example
-  api.openai.com → <your provider>  https://your-relay.example  14 1193ms
+ ROUTES （= what cc-switch has selected per app）
+  api.anthropic.com → <selected claude>  https://your-relay.example  47/9 259ms
+  api.openai.com → <selected codex>  https://relay-2.example  14 1193ms
+  opencode.ai → <selected opencode>  https://api.moonshot.cn/v1  8 640ms
 ACTIVITY
 ────────────────────────────────────────────────────────────
 s 启动/暂停   d doctor   c 卸载证书   q 退出
 ```
 
-Four keys, nothing else:
+Four keys, nothing else (`q` and `Ctrl-C` are the same):
 
 | key | action |
 | --- | --- |
@@ -98,6 +99,8 @@ Four keys, nothing else:
 | `d` | run `doctor` and stream its output into the panel |
 | `c` | install / uninstall the local certificate |
 | `q` | quit |
+
+Quitting is immediate and touches nothing: no certificate work, no waiting on a running command — `q` / `Ctrl-C` kills the panel's children and exits. Certificate changes wait on a macOS authorization prompt; the panel stays responsive while it is up (the status line reads "等待系统授权 …") and `q` cancels the prompt and exits. `Ctrl-C` only quits — it never triggers `c`'s certificate toggle.
 
 `ACTIVITY` only shows lines from the moment the TUI started (plus `doctor` output) — one line per request, no TLS/tunnel noise. The health counters next to each route are seeded from history so you can see which relay is flaky.
 
@@ -122,13 +125,11 @@ Four keys, nothing else:
 | `listen` | where the proxy listens (default `127.0.0.1:8788`) |
 | `tls` | local CA / leaf certificate paths under `certs/` |
 | `intercept` | hostnames to decrypt and reroute |
-| `routes.<host>.protocol` | wire protocol of the upstream: `anthropic` or `openai` |
-| `routes.<host>.ccswitchAppType` | which cc-switch table to read: `claude` or `codex` |
+| `routes.<host>.ccswitchAppType` | which cc-switch app this route feeds from: `claude` / `codex` / `opencode`. The upstream is that app’s currently selected provider |
 | `routes.<host>.authStyle` | how the credential is sent: `both`, `x-api-key`, `bearer` |
-| `routes.<host>.modelMap` | rewrite model ids before forwarding |
+| `routes.<host>.modelMap` | rewrite model ids before forwarding (absent → ids pass through verbatim) |
 | `routes.<host>.stripFields` | drop request fields a relay rejects |
-| `routes.<host>.static` / `staticFirst` | hand-written upstreams that take priority |
-| `routes.<host>.retryStatuses` | statuses that trigger failover |
+| `routes.<host>.stripPrefix` | strip the intercepted host's own path prefix before forwarding (`opencode.ai/zen/go` → upstream `/v1/...`) |
 | `routes.<host>.modelFallback` | ids returned for `GET /v1/models` when the relay has none |
 | `ccswitch.cacheMs` | how long a provider list is cached (default 15 s) |
 
@@ -137,10 +138,23 @@ Four keys, nothing else:
 ## Adding another provider or protocol
 
 1. Add the hostname to `intercept`.
-2. Add a route with the right `protocol` and `ccswitchAppType`.
+2. Add a route with its `ccswitchAppType` (`claude` / `codex` / `opencode`).
 3. Re-run `npm run setup-ca` (it reuses the existing CA and reissues the leaf with the new SANs), then `node src/cli.js trust-ca` is *not* needed — the CA did not change.
+4. If the host keeps its traffic under its own path prefix (`opencode.ai/zen/v1/chat/completions`), add `stripPrefix` to drop it. That is the only knob left — `doctor` derives its probe from `ccswitchAppType`.
 
-Anthropic Messages (`/v1/messages`, streaming SSE) and OpenAI Responses (`/v1/responses`) are supported, including WebSocket upgrades, plus two convenience fallbacks: `count_tokens` is estimated locally when a relay does not implement it, and `GET /v1/models` falls back to a configured list.
+Three shapes, one per app type: Anthropic Messages (`/v1/messages`, `claude`), OpenAI Responses (`/v1/responses`, `codex`), OpenAI Chat Completions (`/v1/chat/completions`, `opencode`). The router does not translate between them — the selected upstream has to speak the same shape. WebSocket upgrades are forwarded verbatim.
+
+Routes shipped today:
+
+| intercepted host | shape | upstreams from |
+| --- | --- | --- |
+| `api.anthropic.com` | Anthropic Messages | cc-switch `claude` selection |
+| `api.openai.com` | Responses (incl. wss) | cc-switch `codex` selection |
+| `opencode.ai` | Chat Completions (Zen `/zen/v1`, Go `/zen/go/v1`) | cc-switch `opencode` selection |
+
+`opencode.ai`'s catalog comes from `models.opencode.ai` (not intercepted), and Delta's OpenCode ids are bare (`kimi-k3`, `glm-5.3`, …) — the same names cc-switch `opencode` providers use as keys in `models`, so no `modelMap` is needed. Non-inference paths (`/zen/go/v1/usage`, sign-in) are rerouted to that upstream too, so the usage display stops working (display only).
+
+Model ids are forwarded verbatim; only an explicit `modelMap` rewrites them.
 
 ## Troubleshooting
 
@@ -148,15 +162,16 @@ Anthropic Messages (`/v1/messages`, streaming SSE) and OpenAI Responses (`/v1/re
 | --- | --- |
 | header shows `proxy 未接入` | `node src/cli.js install-delta`, then restart Delta |
 | header shows `ca 未信任` | press `c` in the TUI (or `node src/cli.js trust-ca`) |
-| header shows `key 缺失` | `node src/cli.js write-keys`, then restart Delta |
-| a route logs `RETRY … 401` | that relay's token is dead — switch provider in cc-switch |
+| header shows `key 缺失`, or a provider in Delta lists no models | `node src/cli.js write-keys`, then restart Delta — Delta only lists models for providers that hold a credential, and a placeholder is enough |
+| a route answers 401/403/5xx | that is the voice of whatever cc-switch has selected — switch provider there, or fix its token |
+| `doctor` reports FAIL | each line means "the provider cc-switch has selected does not answer"; the `cc-switch providers for <host>` line names it |
 | Delta has no network at all | the router is down: press `s` in the TUI; escape hatch is `node src/cli.js uninstall-delta` |
 | `count_tokens estimated` in logs | normal: the relay has no `count_tokens`, the router estimates it |
 | Delta keeps its own settings | Delta rewrites `settings.json` on save; if `native.proxy` disappears, the header says so |
 
 ## Limitations
 
-- The relay must speak the same wire protocol (Anthropic Messages or OpenAI Responses); it is a rerouter, not a protocol translator.
+- The selected relay must speak the same wire shape as the intercepted host; it is a rerouter, not a protocol translator.
 - Requires local TLS interception, so the CA must be trusted; this is inherent to any tool that changes a hardcoded HTTPS endpoint.
 - macOS only for now (`launchd`, `security`, keychain trust). The proxy itself is portable Node; the install helpers are not.
 

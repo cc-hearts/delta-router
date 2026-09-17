@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { loadConfig, ROOT } from './config.js';
 import { resolveUpstreams } from './upstreams.js';
 import * as agent from './agent.js';
@@ -90,7 +90,21 @@ const state = {
   message: '就绪',
   busy: false,
   offset: 0,
+  children: new Set(),
 };
+
+/**
+ * Trust probing spawns `security`, which macOS can hold on an authorization prompt. Cache the
+ * verdict so the render loop cannot hammer it, and bound each probe (see `delta.caTrusted`).
+ */
+const TRUST_TTL_MS = 10000;
+let trust = { at: 0, value: false };
+function caTrusted(force = false) {
+  if (force || Date.now() - trust.at > TRUST_TTL_MS) {
+    trust = { at: Date.now(), value: delta.caTrusted() };
+  }
+  return trust.value;
+}
 
 function bump(name, ok, ms) {
   if (!state.stats.has(name)) state.stats.set(name, { ok: 0, fail: 0, ms: null });
@@ -162,19 +176,31 @@ function health(name) {
 // ------------------------------------------------------------------- actions
 
 function doctor() {
+  if (state.busy) return;
   state.busy = true;
-  state.message = 'doctor 运行中 …';
+  state.message = 'doctor 运行中 …（q 可直接退出）';
   render();
-  const res = spawnSync(process.execPath, [path.join(ROOT, 'src/cli.js'), 'doctor'], {
-    encoding: 'utf8',
-    timeout: 300000,
+  const child = spawn(process.execPath, [path.join(ROOT, 'src/cli.js'), 'doctor'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
-  state.busy = false;
-  const out = `${res.stdout ?? ''}${res.stderr ?? ''}`.trim();
-  state.lines.push(`${C.dim}──── doctor ────${C.r}`);
-  for (const l of out.split('\n')) state.lines.push(l.startsWith('ok') ? `${C.g}${l}${C.r}` : l.startsWith('FAIL') ? `${C.red}${l}${C.r}` : l);
-  state.lines.push('');
-  state.message = res.status === 0 ? 'doctor: 全部通过' : `doctor: 有失败项（exit ${res.status}）`;
+  state.children.add(child);
+  let out = '';
+  child.stdout.on('data', (c) => (out += c));
+  child.stderr.on('data', (c) => (out += c));
+  child.on('error', (err) => {
+    state.busy = false;
+    state.message = `doctor 启动失败: ${err.message}`;
+    render();
+  });
+  child.on('close', (status) => {
+    state.children.delete(child);
+    state.busy = false;
+    state.lines.push(`${C.dim}──── doctor ────${C.r}`);
+    for (const l of out.trim().split('\n')) state.lines.push(l.startsWith('ok') ? `${C.g}${l}${C.r}` : l.startsWith('FAIL') ? `${C.red}${l}${C.r}` : l);
+    state.lines.push('');
+    state.message = status === 0 ? 'doctor: 全部通过' : `doctor: 有失败项（exit ${status}）`;
+    render();
+  });
 }
 
 function toggleRouter() {
@@ -187,9 +213,27 @@ function toggleRouter() {
   }
 }
 
-function toggleCertificate() {
-  state.message = delta.caTrusted() ? delta.untrustCa() : delta.trustCa();
-  state.message += '（重启 Delta 生效）';
+let certAbort = null;
+
+/**
+ * macOS gates trust changes behind an authorization prompt, so this stays async: the panel keeps
+ * taking keys (q aborts the pending prompt and exits) instead of freezing on `security`.
+ */
+async function toggleCertificate() {
+  if (certAbort) return;
+  const wasTrusted = caTrusted();
+  const abort = new AbortController();
+  certAbort = abort;
+  state.message = `${wasTrusted ? '卸载' : '安装'}证书：等待系统授权 …（q 取消并退出）`;
+  render();
+  const pending = wasTrusted
+    ? delta.untrustCa({ signal: abort.signal })
+    : delta.trustCa({ signal: abort.signal });
+  const result = await pending.catch((err) => `证书操作失败: ${err.message}`);
+  certAbort = null;
+  caTrusted(true);
+  state.message = `${result}（重启 Delta 生效）`;
+  render();
 }
 
 // ------------------------------------------------------------------ rendering
@@ -203,7 +247,7 @@ function header(width_) {
   const proxy = delta.deltaSettingsProxy();
   const want = delta.proxyUrl(state.cfg);
   const proxyOk = (proxy ?? '').replace(/\/+$/, '') === want;
-  const trusted = delta.caTrusted();
+  const trusted = caTrusted();
   const keys = delta.placeholderKeysPresent();
   const todo = [
     !proxyOk && 'node src/cli.js install-delta',
@@ -244,7 +288,7 @@ function routeRows(w) {
 }
 
 function footer(w) {
-  const cert = delta.caTrusted() ? '卸载证书' : '安装证书';
+  const cert = caTrusted() ? '卸载证书' : '安装证书';
   const keys =
     `${C.b}s${C.r} 启动/暂停   ${C.b}d${C.r} doctor   ${C.b}c${C.r} ${cert}   ${C.b}q${C.r} 退出`;
   const msg = state.busy ? `${C.y}${state.message}${C.r}` : state.message;
@@ -287,14 +331,20 @@ function render() {
 // -------------------------------------------------------------------- input
 
 const KEYS = {
-  '\u0003': () => quit(),
   q: () => quit(),
   s: toggleRouter,
   d: doctor,
   c: toggleCertificate,
 };
 
+let quitting = false;
+
+/** Quitting is unconditional and instant: no teardown, no certificate work, no waiting. */
 function quit() {
+  if (quitting) return;
+  quitting = true;
+  certAbort?.abort();
+  for (const child of state.children) child.kill('SIGKILL');
   OUT.write('\x1b[?25h\x1b[?1049l');
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
   process.exit(0);
@@ -303,6 +353,12 @@ function quit() {
 readline.emitKeypressEvents(process.stdin);
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.on('keypress', (str, key) => {
+  // readline reports Ctrl-<letter> with the bare letter as `name`, so Ctrl-C used to fire the
+  // certificate toggle (and its password prompt). Ctrl chords never trigger single-key actions.
+  if (key?.ctrl) {
+    if (key.name === 'c') quit();
+    return;
+  }
   const handler = KEYS[key?.name ?? str];
   if (handler) {
     handler();
@@ -313,8 +369,7 @@ process.stdin.on('keypress', (str, key) => {
 
 startSession();
 OUT.write('\x1b[?1049h\x1b[?25l');
-process.on('SIGINT', quit);
-process.on('SIGTERM', quit);
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, quit);
 process.on('exit', () => OUT.write('\x1b[?25h\x1b[?1049l'));
 OUT.on('resize', () => {
   lastFrame = [];
