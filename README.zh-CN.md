@@ -172,6 +172,7 @@ s 启动/暂停   d doctor   c 卸载证书   q 退出
 ## 限制
 
 - 中转必须说同一种协议（Anthropic Messages 或 OpenAI Responses）—— 这是改道器，不是协议转换器。
+- OpenCode 的账号接口（`/zen/*/v1/usage`）由路由器**本地应答** `200 {}`：Delta 要从这里拿到 200 才肯启用该 provider，否则报 `API endpoint not found.`（改道后这个请求会落到 cc-switch 的上游，那边没有这个路径）。代价是用量显示为空；数字本来也无意义 —— 推理用的是 cc-switch 的凭据。
 - 依赖本地 TLS 拦截，因此必须信任本地 CA；任何"改掉硬编码 HTTPS 端点"的方案都躲不开这一步。
 - 目前仅 macOS（`launchd`、`security`、钥匙串信任）。代理本身是纯 Node、可移植，只是安装辅助脚本不是。
 

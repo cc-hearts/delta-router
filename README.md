@@ -172,6 +172,7 @@ Model ids are forwarded verbatim; only an explicit `modelMap` rewrites them.
 ## Limitations
 
 - The selected relay must speak the same wire shape as the intercepted host; it is a rerouter, not a protocol translator.
+- OpenCode's account endpoint (`/zen/*/v1/usage`) is answered **locally** with `200 {}`: Delta only enables the provider once that call succeeds, and otherwise reports `API endpoint not found.` (rerouted, the call lands on a cc-switch upstream that has no such path). The cost is an empty usage display — those numbers are meaningless here anyway, since inference runs on the cc-switch credential.
 - Requires local TLS interception, so the CA must be trusted; this is inherent to any tool that changes a hardcoded HTTPS endpoint.
 - macOS only for now (`launchd`, `security`, keychain trust). The proxy itself is portable Node; the install helpers are not.
 

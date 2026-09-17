@@ -294,6 +294,22 @@ function attempt({ req, res, target, upstream, headers, body, route, started }) 
           return resolve({ status: 200, note: 'count_tokens estimated' });
         }
 
+        // OpenCode's account/usage endpoint only exists on the real service; behind a rerouted
+        // upstream it 404s and Delta reports "API endpoint not found." for the provider. Answer it
+        // locally so the provider stays usable — the numbers are meaningless here anyway, since
+        // inference runs on the cc-switch credential, not Delta's.
+        if (
+          route.ccswitchAppType === 'opencode' &&
+          req.method === 'GET' &&
+          req.url.split('?')[0].endsWith('/v1/usage') &&
+          status >= 400
+        ) {
+          upRes.resume();
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('{}');
+          return resolve({ status: 200, note: 'usage synthesized' });
+        }
+
         // /v1/models fallback so an empty picker is not the only outcome.
         if (req.method === 'GET' && req.url.replace(/\?.*$/, '') === '/v1/models' && status >= 400) {
           upRes.resume();
