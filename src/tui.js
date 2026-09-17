@@ -204,7 +204,7 @@ function doctor() {
 }
 
 function toggleRouter() {
-  if (state.loaded) {
+  if (state.loaded || state.pid) {
     agent.stop();
     state.message = '已暂停：Delta 现在没有网络出口（再按 s 恢复）';
   } else {
@@ -344,7 +344,15 @@ function quit() {
   if (quitting) return;
   quitting = true;
   certAbort?.abort();
-  for (const child of state.children) child.kill('SIGKILL');
+  for (const child of state.children) {
+    try {
+      if (process.platform === 'win32') {
+        spawnSync('taskkill', ['/PID', String(child.pid), '/F', '/T'], { stdio: 'ignore' });
+      } else {
+        child.kill('SIGKILL');
+      }
+    } catch {}
+  }
   OUT.write('\x1b[?25h\x1b[?1049l');
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
   process.exit(0);

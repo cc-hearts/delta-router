@@ -1,5 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 /**
  * Upstreams come from cc-switch's own database, so switching provider there re-routes Delta
@@ -40,14 +43,24 @@ export function readCcSwitchProviders(dbFile) {
   if (!fs.existsSync(dbFile)) return [];
   let rows;
   try {
-    const out = execFileSync(
-      'sqlite3',
-      ['-json', dbFile, 'SELECT id, app_type, name, is_current, settings_config FROM providers'],
-      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
-    );
-    rows = JSON.parse(out || '[]');
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(dbFile, { readOnly: true, open: true });
+    try {
+      rows = db.prepare('SELECT id, app_type, name, is_current, settings_config FROM providers').all();
+    } finally {
+      db.close();
+    }
   } catch {
-    return [];
+    try {
+      const out = execFileSync(
+        'sqlite3',
+        ['-json', dbFile, 'SELECT id, app_type, name, is_current, settings_config FROM providers'],
+        { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+      );
+      rows = JSON.parse(out || '[]');
+    } catch {
+      return [];
+    }
   }
 
   const providers = [];

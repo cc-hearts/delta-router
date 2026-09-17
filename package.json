@@ -14,7 +14,7 @@
     "doctor": "node src/cli.js doctor",
     "test-delta": "node src/cli.js test-delta",
     "status": "node src/cli.js status",
-    "setup-ca": "bash scripts/setup-ca.sh"
+    "setup-ca": "node scripts/setup-ca.js"
   },
   "keywords": [
     "delta",

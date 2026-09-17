@@ -48,10 +48,11 @@ Delta ──┐  native.proxy = http://127.0.0.1:8788   （写在 Delta 自己�
 
 ## 环境要求
 
-- macOS（用到 `launchd`、`security` 和登录钥匙串）
+- macOS 或 Windows 10/11
 - Node.js ≥ 20
-- Delta 0.1.x —— 在 0.1.0（`com.zed-industries.delta`）上验证
+- Delta 0.1.x —— 在 macOS 和 Windows 0.1.0（`com.zed-industries.delta`）上验证
 - cc-switch 里至少有一条 `claude` 或 `codex` provider
+- `openssl`（Windows 下 Git 等自带即可）
 
 ## 安装
 
@@ -174,7 +175,7 @@ s 启动/暂停   d doctor   c 卸载证书   q 退出
 - 中转必须说同一种协议（Anthropic Messages 或 OpenAI Responses）—— 这是改道器，不是协议转换器。
 - OpenCode 的账号接口（`/zen/*/v1/usage`）由路由器**本地应答** `200 {}`：Delta 要从这里拿到 200 才肯启用该 provider，否则报 `API endpoint not found.`（改道后这个请求会落到 cc-switch 的上游，那边没有这个路径）。代价是用量显示为空；数字本来也无意义 —— 推理用的是 cc-switch 的凭据。
 - 依赖本地 TLS 拦截，因此必须信任本地 CA；任何"改掉硬编码 HTTPS 端点"的方案都躲不开这一步。
-- 目前仅 macOS（`launchd`、`security`、钥匙串信任）。代理本身是纯 Node、可移植，只是安装辅助脚本不是。
+- 支持 macOS（`launchd`、`security`、钥匙串）与 Windows（后台守护/开机自启、`certutil` 用户受信任根证书库）。
 
 ## 卸载
 

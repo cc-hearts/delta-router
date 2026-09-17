@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { loadConfig } from './config.js';
 import { readCcSwitchProviders, resolveUpstreams } from './upstreams.js';
 import * as agent from './agent.js';
 import * as delta from './delta.js';
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 
 const cfg = loadConfig();
 const cmd = process.argv[2] ?? 'help';
@@ -131,11 +137,27 @@ const commands = {
   'test-delta'() {
     const marker = logLines().length;
     console.log('restarting Delta …');
-    spawnSync('osascript', ['-e', 'quit app "Delta"']);
-    spawnSync('sleep', ['5']);
-    spawnSync('open', ['-a', 'Delta']);
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/IM', 'delta.exe', '/F'], { stdio: 'ignore' });
+      sleepMs(2000);
+      const deltaBin = path.join(
+        process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
+        'Programs',
+        'Delta',
+        'delta.exe',
+      );
+      if (fs.existsSync(deltaBin)) {
+        spawn('cmd.exe', ['/c', 'start', '', deltaBin], { detached: true, stdio: 'ignore' }).unref();
+      } else {
+        spawn('cmd.exe', ['/c', 'start', '', 'delta'], { detached: true, stdio: 'ignore' }).unref();
+      }
+    } else {
+      spawnSync('osascript', ['-e', 'quit app "Delta"']);
+      sleepMs(5000);
+      spawnSync('open', ['-a', 'Delta']);
+    }
     for (let i = 0; i < 12; i++) {
-      spawnSync('sleep', ['5']);
+      sleepMs(5000);
       const fresh = logLines().slice(marker);
       const hits = fresh.filter((l) => cfg.intercept.some((h) => l.includes(h)));
       if (hits.some((l) => l.includes('ROUTE'))) {
@@ -154,7 +176,9 @@ const commands = {
   status() {
     console.log(`config        ${cfg.file}`);
     console.log(`listen        ${cfg.listen.host}:${cfg.listen.port}`);
-    console.log(`router        ${agent.listenerPid(cfg.listen.port) ?? 'stopped'}${agent.isLoaded() ? ' (launchd)' : ''}`);
+    const isServiceLoaded = agent.isLoaded();
+    const serviceLabel = process.platform === 'win32' ? ' (startup service)' : ' (launchd)';
+    console.log(`router        ${agent.listenerPid(cfg.listen.port) ?? 'stopped'}${isServiceLoaded ? serviceLabel : ''}`);
     console.log(`delta proxy   ${delta.deltaSettingsProxy() ?? '(unset)'}`);
     console.log(`delta keys    ${delta.placeholderKeysPresent() ? 'placeholder set' : 'missing'}`);
     console.log(`ca trusted    ${delta.caTrusted() ? 'yes' : 'no'}  (${cfg.tls.ca})`);
@@ -174,7 +198,7 @@ const commands = {
   upstreams() {
     for (const p of readCcSwitchProviders(cfg.ccswitch.db)) {
       console.log(
-        `${p.protocol.padEnd(9)} ${p.name.padEnd(26)} current=${p.current ? 'y' : 'n'} ${p.base} key=${mask(p.key)}`,
+        `${(p.appType ?? p.protocol ?? '').padEnd(9)} ${p.name.padEnd(26)} current=${p.current ? 'y' : 'n'} ${p.base} key=${mask(p.key)}`,
       );
     }
   },
@@ -196,9 +220,13 @@ const commands = {
   },
 
   'install-agent'() {
-    const err = agent.start(cfg);
+    const err = agent.installAgent ? agent.installAgent(cfg) : agent.start(cfg);
     console.log(err ? `bootstrap failed: ${err}` : `loaded ${agent.LABEL}`);
-    console.log(agent.PLIST);
+    if (agent.WIN_STARTUP && process.platform === 'win32') {
+      console.log(`startup script: ${agent.WIN_STARTUP}`);
+    } else {
+      console.log(agent.PLIST);
+    }
   },
 
   'uninstall-agent'() {
